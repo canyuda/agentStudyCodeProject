@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Streaming Agent Gateway</title>
+  <style>
+    /* 教学页面：极简样式，重点在交互逻辑（见底部脚本） */
+    body { margin: 0; padding: 24px; background: #f5f7fb; color: #1f2937;
+           font-family: -apple-system, "Segoe UI", sans-serif; }
+    .card { background: #fff; border: 1px solid #dbe3f0; border-radius: 12px;
+            padding: 16px; margin-bottom: 16px; }
+    textarea { width: 100%; min-height: 64px; box-sizing: border-box;
+               border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px; font: inherit; }
+    button { border: 0; border-radius: 999px; padding: 8px 14px; margin-right: 8px;
+             cursor: pointer; background: #2563eb; color: #fff; font: inherit; }
+    button.ghost { background: #e2e8f0; color: #0f172a; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; font-size: 14px; margin: 6px 0; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    #text { white-space: pre-wrap; line-height: 1.7; min-height: 100px; }
+    #log, .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
+    #log { background: #0f172a; color: #e2e8f0; border-radius: 8px; padding: 12px;
+           white-space: pre-wrap; word-break: break-all; max-height: 320px; overflow-y: auto;
+           font-size: 12px; }
+    .hint { color: #475569; font-size: 13px; margin-top: 8px; }
+    h2 { margin: 0 0 8px; font-size: 15px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <textarea id="prompt">用一段话解释：断线重连为什么不会重复调用模型？</textarea>
+    <div style="margin-top:10px">
+      <button id="btn-create">创建 Run 并订阅</button>
+      <button id="btn-disconnect" class="ghost" disabled>断开订阅</button>
+      <button id="btn-reconnect" class="ghost" disabled>重连续读</button>
+      <button id="btn-cancel" class="ghost" disabled>取消 Run</button>
+    </div>
+    <div class="hint">
+      断开/重连演示「断线不重跑」：订阅断了 Run 照常跑，重连后从上次 seq 继续；
+      取消演示「取消真停止」：模型立刻停，收到终态事件。
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row"><b>Run ID：</b><span id="run-id" class="mono">（尚未创建）</span></div>
+    <div class="row"><b>连接状态：</b><span id="conn">未连接</span></div>
+    <div class="row"><b>指标：</b><span id="metrics" class="mono">—</span></div>
+    <div class="row"><b>已收到：</b><span id="progress" class="mono">seq —</span></div>
+  </div>
+
+  <div class="grid">
+    <div class="card"><h2>拼接后的模型文本</h2><div id="text">等待输出…</div></div>
+    <div class="card"><h2>事件流日志</h2><div id="log">等待事件…</div></div>
+  </div>
+
+<script>
+  // ---- 状态：当前 Run、已收到的最大 seq（重连断点）、EventSource 句柄 ----
+  let currentRunId = null, lastSeq = -1, es = null;
+  const $ = (id) => document.getElementById(id);
+  const STORAGE_KEY = "sag-demo-state";
+
+  function save() {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ runId: currentRunId, lastSeq }));
+  }
+  function log(line) {
+    const el = $("log");
+    el.textContent = (el.textContent === "等待事件…" ? "" : el.textContent) + line + "\n";
+    el.scrollTop = el.scrollHeight;
+  }
+  function buttons() {
+    const hasRun = !!currentRunId, connected = !!es;
+    $("btn-disconnect").disabled = !hasRun || !connected;
+    $("btn-reconnect").disabled = !hasRun || connected;
+    $("btn-cancel").disabled = !hasRun;
+  }
+  function closeES() { if (es) { es.close(); es = null; } buttons(); }
+
+  function handle(type, payload) {
+    lastSeq = payload.seq;                       // 每个事件都推进断点游标
+    $("progress").textContent = `seq ${lastSeq}（${type}）`;
+    if (type === "text.delta") {
+      const el = $("text");
+      el.textContent = (el.textContent === "等待输出…" ? "" : el.textContent) + payload.data.delta;
+    } else if (type === "run.metrics") {
+      $("metrics").textContent =
+        `TTFT ${payload.data.ttft_ms}ms · 总耗时 ${payload.data.total_ms}ms · ${payload.data.deltas} 个 delta`;
+    } else if (type === "run.completed" || type === "run.cancelled" || type === "run.failed") {
+      $("conn").textContent = `已结束（${type}）`;
+      log(`[终态] ${type} ${JSON.stringify(payload.data)}`);
+      closeES(); save(); return;
+    }
+    log(`#${payload.seq} ${type} ${type === "text.delta" ? payload.data.delta : JSON.stringify(payload.data)}`);
+    save();
+  }
+
+  function subscribe() {
+    // 关键：浏览器 EventSource 不能自定义请求头，手动重连的断点只能走 ?after_seq=
+    es = new EventSource(`/v1/runs/${currentRunId}/events?after_seq=${lastSeq}`);
+    $("conn").textContent = lastSeq >= 0 ? `已连接（从 seq ${lastSeq + 1} 续读）` : "已连接";
+    buttons();
+    es.onopen = () => { $("conn").textContent = `已连接，接收中…`; };
+    es.onerror = () => { $("conn").textContent = "连接断开（Run 仍在运行）"; closeES(); };
+    // 为每种事件类型注册监听（SSE 的 event: 行会变成 addEventListener 的事件名）
+    for (const t of ["run.created", "run.started", "text.delta", "checkpoint.saved",
+                     "run.metrics", "run.completed", "run.cancelled", "run.failed"]) {
+      es.addEventListener(t, (e) => handle(t, JSON.parse(e.data)));
+    }
+  }
+
+  $("btn-create").onclick = async () => {
+    const prompt = $("prompt").value.trim();
+    if (!prompt) { alert("请输入 prompt"); return; }
+    const r = await fetch("/v1/runs", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    });
+    const j = await r.json();
+    currentRunId = j.run_id; lastSeq = -1;
+    $("run-id").textContent = currentRunId;
+    $("text").textContent = "等待输出…"; $("log").textContent = "等待事件…";
+    $("metrics").textContent = "—";
+    log(`[创建] POST /v1/runs -> ${currentRunId}`);
+    subscribe();
+  };
+
+  $("btn-disconnect").onclick = () => {
+    log(`[断开] 只关闭订阅，Run 继续在服务端运行，当前断点 seq=${lastSeq}`);
+    $("conn").textContent = "已手动断开";
+    closeES(); save();
+  };
+
+  $("btn-reconnect").onclick = () => {
+    log(`[重连] GET /v1/runs/${currentRunId}/events?after_seq=${lastSeq}（不创建新调用）`);
+    subscribe();
+  };
+
+  $("btn-cancel").onclick = async () => {
+    const r = await fetch(`/v1/runs/${currentRunId}/cancel`, { method: "POST" });
+    log(`[取消] ${JSON.stringify(await r.json())}`);
+  };
+
+  // ---- 刷新恢复：只恢复显示，不自动重连（避免误建新调用） ----
+  (function restore() {
+    try {
+      const s = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+      if (s && s.runId) {
+        currentRunId = s.runId; lastSeq = s.lastSeq ?? -1;
+        $("run-id").textContent = currentRunId;
+        $("conn").textContent = "页面刷新过；点「重连续读」恢复订阅";
+      }
+    } catch {}
+    buttons();
+  })();
+</script>
+</body>
+</html>
