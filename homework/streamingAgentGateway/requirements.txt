@@ -2,7 +2,7 @@
 # - 核心链路（events / sse / model / fake_model / store / loop / server）
 #   只用标准库 + fastapi，跑 FakeModel 时完全不依赖 openai SDK。
 # - openai 仅在 DeepSeek Adapter（deepseek_adapter.py）中使用。
-# - key 从 project/.env 读取（DEEPSEEK_API_KEY），该文件已被 gitignore。
+# - key 从 agentStudyCodeProject/.env 读取（DEEPSEEK_API_KEY），该文件已被 gitignore。
 
 fastapi>=0.110
 uvicorn>=0.29

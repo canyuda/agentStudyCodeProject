@@ -15,7 +15,7 @@
    继续跑完并写终态；客户端带 Last-Event-ID 重连后从账本补发即可。
 
 启动方式（详见 README）：
-  cd project/homework/streamingAgentGateway
+  cd agentStudyCodeProject/homework/streamingAgentGateway
   ../../.venv/bin/python -m uvicorn gateway.server:app --port 8300
   环境变量 GATEWAY_MODEL=deepseek 切换真实模型（默认 fake）
 """
@@ -45,7 +45,7 @@ from .store import Run, RunStore
 # Web 首页（第 8 步的浏览器客户端）
 _INDEX_HTML = Path(__file__).resolve().parent / "static" / "index.html"
 
-# 服务启动时统一从 project/.env 加载配置（GATEWAY_* / DEEPSEEK_*）。
+# 服务启动时统一从 agentStudyCodeProject/.env 加载配置（GATEWAY_* / DEEPSEEK_*）。
 # override=False：命令行已 export 的环境变量优先于 .env，便于临时覆盖。
 load_dotenv(DEFAULT_ENV_PATH)
 

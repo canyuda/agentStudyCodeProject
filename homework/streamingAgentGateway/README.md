@@ -61,10 +61,10 @@
 ## 快速开始
 
 ```bash
-cd project/homework/streamingAgentGateway
-PY=../../.venv/bin/python     # 解释器：project/.venv
+cd agentStudyCodeProject/homework/streamingAgentGateway
+PY=../../.venv/bin/python     # 解释器：agentStudyCodeProject/.venv
 
-# 1) 起服务（默认 fake + SQLite 持久化，配置见 project/.env）
+# 1) 起服务（默认 fake + SQLite 持久化，配置见 agentStudyCodeProject/.env）
 $PY -m uvicorn gateway.server:app --port 8300
 
 # 2) 打开浏览器 http://127.0.0.1:8300/ （Web 客户端）
@@ -72,7 +72,7 @@ $PY -m uvicorn gateway.server:app --port 8300
 $PY -m gateway.cli "用一段话解释 SSE"
 $PY -m gateway.cli --resume <run_id> --after <seq>   # 断点续读
 
-# 3) 切真实模型（读 project/.env 的 DEEPSEEK_API_KEY）
+# 3) 切真实模型（读 agentStudyCodeProject/.env 的 DEEPSEEK_API_KEY）
 GATEWAY_MODEL=deepseek $PY -m uvicorn gateway.server:app --port 8300
 
 # 4) 跑测试（35 个）

@@ -6,7 +6,7 @@
 - Adapter 的唯一职责是"翻译"：DeepSeek chunk -> ModelStreamEvent，
   它不知道 RunEvent、run_id、seq 的存在（那是 Agent Loop 的事）。
 - 网络参数集中为模块常量，并支持环境变量覆盖，不在业务代码里散落魔法值：
-    DEEPSEEK_API_KEY    必需，从 project/.env 读取（该文件已被 gitignore）
+    DEEPSEEK_API_KEY    必需，从 agentStudyCodeProject/.env 读取（该文件已被 gitignore）
     DEEPSEEK_BASE_URL   可选，默认官方地址
     DEEPSEEK_MODEL      可选，默认 deepseek-v4-flash
 """
@@ -25,7 +25,7 @@ from .model import Message, ModelStreamEvent
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_MAX_TOKENS = 1024
-# project/.env 位于本文件向上三级（gateway/ -> streamingAgentGateway/ -> homework/ -> project/）
+# agentStudyCodeProject/.env 位于本文件向上三级（gateway/ -> streamingAgentGateway/ -> homework/ -> agentStudyCodeProject/）
 DEFAULT_ENV_PATH = Path(__file__).resolve().parents[3] / ".env"
 
 
