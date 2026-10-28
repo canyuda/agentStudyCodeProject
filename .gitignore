@@ -12,3 +12,4 @@ gateway.db*
 
 # macOS
 .DS_Store
+.idea/
