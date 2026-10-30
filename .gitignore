@@ -10,6 +10,9 @@ __pycache__/
 # streamingAgentGateway SQLite 持久化文件（含 WAL 副本）
 gateway.db*
 
+# video-agent-kit 插件工作缓存
+.video_agent/
+
 # macOS
 .DS_Store
 .idea/
