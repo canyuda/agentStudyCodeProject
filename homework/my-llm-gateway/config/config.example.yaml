@@ -1,0 +1,83 @@
+# Built-in example configuration: safe defaults, runs out of the box (mock-friendly).
+# Override with GATEWAY_CONFIG=/path/to/your.yaml. Secrets are injected ONLY via
+# environment variables (${VAR} / ${VAR:-default}); never hardcode keys here.
+
+service:
+  name: my-llm-gateway
+  host: 127.0.0.1
+  port: 8000
+
+auth:
+  gateway_keys:
+    - ${GATEWAY_API_KEY:-gw-demo-key-change-me}
+
+database:
+  path: data/gateway.db
+
+retry:
+  max_attempts: 3              # total attempts per candidate route (1 original + 2 retries)
+  base_delay_seconds: 0.25
+  max_delay_seconds: 4.0
+  jitter: 0.25                 # +/-25%
+  retryable_statuses: [408, 409, 429, 500, 502, 503, 504]
+
+circuit_breaker:
+  failure_threshold: 5         # consecutive failures before opening (per provider)
+  cooldown_seconds: 30
+
+rate_limit:
+  requests_per_minute: 120     # per caller key + model alias
+  burst: 20
+
+structured_output:
+  max_repair_rounds: 1         # default 1, hard cap 3
+
+stream_checkpoint:
+  enabled: false               # persists model text - see README privacy warning
+  interval_seconds: 1.0
+  max_chars: 20000
+
+masking:
+  enabled: false               # PII masking off by default
+  rules:
+    secret_key: { enabled: true }
+    bank_card: { enabled: true }
+    id_card: { enabled: true }
+    phone: { enabled: true }
+    email: { enabled: true }
+
+providers:
+  deepseek_responses:
+    protocol: openai_responses
+    base_url: https://api.deepseek.com/v1
+    api_key: ${DEEPSEEK_API_KEY:-dummy-mock-key}
+    enabled: true
+    timeout: { connect_seconds: 5, total_seconds: 120 }
+    headers: {}
+  deepseek_anthropic:
+    protocol: anthropic_messages
+    base_url: https://api.deepseek.com/anthropic
+    api_key: ${DEEPSEEK_API_KEY:-dummy-mock-key}
+    enabled: true
+    timeout: { connect_seconds: 5, total_seconds: 120 }
+    headers:
+      anthropic-version: "2023-06-01"
+
+aliases:
+  deepseek-pro:
+    strategy: priority
+    routes:
+      - { provider: deepseek_responses, model: deepseek-v4-pro, weight: 1 }
+  deepseek-flash:
+    strategy: weighted
+    routes:
+      - { provider: deepseek_anthropic, model: deepseek-v4-flash, weight: 1 }
+
+pricing: # USD per million tokens; missing alias -> cost 0
+  deepseek-pro:
+    input_per_million: 4.0
+    output_per_million: 16.0
+    cache_input_per_million: 1.0
+  deepseek-flash:
+    input_per_million: 0.8
+    output_per_million: 3.2
