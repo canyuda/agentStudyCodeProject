@@ -4,6 +4,8 @@ from openai import OpenAI
 
 from search_orders_tool import SEARCH_ORDERS
 
+from dotenv import load_dotenv
+load_dotenv()
 
 client = OpenAI(
     api_key=os.environ["DEEPSEEK_API_KEY"],

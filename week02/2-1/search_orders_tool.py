@@ -5,6 +5,7 @@ from execution_context import ExecutionContext
 from order_schemas import OrderSummary, SearchOrdersInput, SearchOrdersOutput, ToolError
 from tool_definition import ToolDefinition
 
+
 async def search_orders(
     args: SearchOrdersInput,
     ctx: "ExecutionContext",

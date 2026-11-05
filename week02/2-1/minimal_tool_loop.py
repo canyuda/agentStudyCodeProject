@@ -8,7 +8,9 @@ from execution_context import ExecutionContext
 from search_orders_tool import DemoOrderService, SEARCH_ORDERS
 from tool_messages import ToolCall
 from tool_runtime import ToolRuntime
+from dotenv import load_dotenv
 
+load_dotenv()
 MAX_STEPS = 4
 
 
@@ -35,6 +37,7 @@ async def run_order_agent(
         print(f"\n=== 第 {step} 轮：计算当前可见工具 ===")
         print([tool["function"]["name"] for tool in visible_tools])
         print("=== 请求 DeepSeek ===")
+        print(json.dumps(messages, indent=4, ensure_ascii=False))
         response = client.chat.completions.create(
             model="deepseek-v4-flash",
             messages=messages,
@@ -42,6 +45,7 @@ async def run_order_agent(
             tool_choice="auto",
             extra_body={"thinking": {"type": "disabled"}},
         )
+        print(json.dumps(response.model_dump(), indent=4, ensure_ascii=False))
 
         assistant = response.choices[0].message
         messages.append(assistant.model_dump(exclude_none=True))
@@ -84,7 +88,7 @@ async def main() -> None:
         order_service=DemoOrderService(),
     )
     answer = await run_order_agent(
-        "查一下我昨天创建、还没有支付的订单。",
+        "查一下我2026-08-18创建、还没有支付的订单。",
         runtime,
         ctx,
         create_client(),
