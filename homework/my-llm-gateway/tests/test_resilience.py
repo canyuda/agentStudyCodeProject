@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 
 from gateway.config import BreakerCfg, RateLimitCfg
-from tests.conftest import build_ctx, make_config
+from tests.conftest import AUTH, build_ctx, make_config
 
 
 def test_retry_then_failover_success_counts_in_ledger(ctx):
@@ -65,6 +65,41 @@ def test_rate_limit_429_per_key_and_alias(tmp_path):
         assert other.status_code in (200, 401)  # second key not in config -> 401
         cfg2_keys = ctx.client.app.state.gateway.config.auth.gateway_keys
         assert cfg2_keys == ["test-gateway-key"]
+
+
+def test_rate_limit_429_landed_in_ledger_other_model_unaffected(tmp_path):
+    """Local rate-limit rejections enter request-lifecycle accounting: after
+    exhausting one model's quota the caller can look the 429 up by the returned
+    X-Request-Id, while the other model's bucket stays untouched."""
+    cfg = make_config(tmp_path, rate_limit=RateLimitCfg(requests_per_minute=60, burst=1))
+    ctx = build_ctx(tmp_path, config=cfg)
+    with ctx.client:
+        ctx.anth.default_text("x")
+        ctx.resp.default_text("x")
+        assert ctx.chat({"model": "flash"}).status_code == 200  # burns flash's only token
+        rejected = ctx.chat({"model": "flash"})
+        assert rejected.status_code == 429
+        rid = rejected.headers["x-request-id"]
+        assert rid
+        # the rejection is queryable by request id, with full failure metadata
+        rows = ctx.client.get(f"/admin/usage?request_id={rid}", headers=AUTH).json()["records"]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["request_id"] == rid
+        assert row["alias"] == "flash" and row["entrypoint"] == "/v1/chat/completions"
+        assert row["status"] == "failed" and row["http_status"] == 429
+        assert row["error_type"] == "rate_limit_error"
+        assert row["provider"] is None and row["protocol"] is None  # never reached upstream
+        assert row["input_tokens"] == 0 and row["output_tokens"] == 0
+        # the OTHER model has its own bucket and still works
+        assert ctx.chat({"model": "pro"}).status_code == 200
+        # the /v1/responses entry records its rejections the same way
+        r2 = ctx.client.post("/v1/responses", json={"model": "flash", "input": "x"}, headers=AUTH)
+        assert r2.status_code == 429
+        rows2 = ctx.client.get(
+            f"/admin/usage?request_id={r2.headers['x-request-id']}", headers=AUTH
+        ).json()["records"]
+        assert rows2[0]["entrypoint"] == "/v1/responses" and rows2[0]["http_status"] == 429
 
 
 def test_rate_limit_isolated_per_key(tmp_path):

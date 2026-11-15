@@ -20,9 +20,14 @@ router = APIRouter()
 async def usage(
     limit: int = Query(default=20, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    request_id: str | None = Query(default=None, description="按网关请求 ID（X-Request-Id）精确对账"),
     state: AppState = Depends(get_state),
     _key: str = Depends(require_auth),
 ):
+    # 带 request_id 时走精确查询：调用方凭响应头回查该次调用（含限流 429 等
+    # 本地拒绝），失败调用不再"账本外隐身"
+    if request_id is not None:
+        return {"request_id": request_id, "records": await state.ledger.by_request(request_id)}
     records = await state.ledger.recent(limit=limit, offset=offset)
     return {"limit": limit, "offset": offset, "records": records}
 

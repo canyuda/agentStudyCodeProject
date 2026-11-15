@@ -97,11 +97,16 @@ class Usage(BaseModel):
 
     cache_tokens = 缓存命中的输入 Token（Anthropic 的
     cache_read_input_tokens / OpenAI 的 cached_tokens 都归一到这里）。
+    reasoning_tokens = 推理/思考 Token（Responses 的
+    output_tokens_details.reasoning_tokens）：它已包含在 output_tokens 里、
+    随输出一起计费，单独保留分类是为了对账时能区分"正文输出"与"不可见
+    推理"的消耗；不提供该分类的上游协议（如标准 Anthropic Messages）恒为 0。
     """
 
     input_tokens: int = 0
     output_tokens: int = 0
     cache_tokens: int = 0
+    reasoning_tokens: int = 0
 
 
 class CompletionResult(BaseModel):

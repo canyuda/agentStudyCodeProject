@@ -84,17 +84,20 @@ class FakeUpstream:
         text = behavior.get("text", "")
         usage = behavior.get("usage") or {"input_tokens": 10, "output_tokens": 5}
         if self.protocol == "openai_responses":
+            # real Responses usage nests cache/reasoning breakdowns in *_details objects
+            usage_body = dict(usage)
+            usage_body["input_tokens_details"] = {"cached_tokens": behavior.get("cached_tokens", 0)}
+            usage_body["output_tokens_details"] = {"reasoning_tokens": behavior.get("reasoning_tokens", 0)}
             body: dict[str, Any] = {
                 "id": "resp_fake",
                 "status": "incomplete" if behavior.get("finish") == "length" else "completed",
                 "output": [
                     {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}
                 ],
-                "usage": dict(usage),
+                "usage": usage_body,
             }
             if body["status"] == "incomplete":
                 body["incomplete_details"] = {"reason": "max_output_tokens"}
-                body["usage"] = dict(usage)
             return body
         usage_with_cache = {"input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"],
                             "cache_read_input_tokens": behavior.get("cache_tokens", 0)}
@@ -120,6 +123,8 @@ class FakeUpstream:
         usage = behavior.get("usage") or {"input_tokens": 12, "output_tokens": 7}
         finish = behavior.get("finish", "stop")
         if self.protocol == "openai_responses":
+            usage_body = dict(usage)
+            usage_body["output_tokens_details"] = {"reasoning_tokens": behavior.get("reasoning_tokens", 0)}
             chunks.append(_sse("response.created", {"type": "response.created", "response": {}}))
             if behavior.get("abort_after") == 0:  # die before any content byte
                 chunks.append(_sse("response.failed", {"type": "response.failed",
@@ -134,11 +139,15 @@ class FakeUpstream:
                     return self._sse_response(chunks)
             chunks.append(_sse("response.completed", {
                 "type": "response.completed",
-                "response": {"status": "incomplete" if finish == "length" else "completed", "usage": dict(usage)},
+                "response": {"status": "incomplete" if finish == "length" else "completed", "usage": usage_body},
             }))
         else:
+            # real standard Anthropic shape: input/cache usage ONLY in message_start,
+            # cumulative output ONLY in message_delta - the gateway must merge them
             chunks.append(_sse("message_start", {"type": "message_start",
-                                                 "message": {"usage": {"input_tokens": usage["input_tokens"]}}}))
+                                                 "message": {"usage": {
+                                                     "input_tokens": usage["input_tokens"],
+                                                     "cache_read_input_tokens": behavior.get("cache_tokens", 0)}}}))
             chunks.append(_sse("content_block_start", {"type": "content_block_start", "index": 0,
                                                        "content_block": {"type": "text"}}))
             if behavior.get("abort_after") == 0:  # die before any content byte
@@ -156,8 +165,7 @@ class FakeUpstream:
             chunks.append(_sse("message_delta", {
                 "type": "message_delta",
                 "delta": {"stop_reason": "max_tokens" if finish == "length" else "end_turn"},
-                "usage": {"input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"],
-                          "cache_read_input_tokens": behavior.get("cache_tokens", 0)},
+                "usage": {"output_tokens": usage["output_tokens"]},
             }))
             chunks.append(_sse("message_stop", {"type": "message_stop"}))
         return self._sse_response(chunks)

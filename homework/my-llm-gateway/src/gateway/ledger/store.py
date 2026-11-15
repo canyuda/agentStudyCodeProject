@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS usage_records (
   input_tokens INTEGER NOT NULL DEFAULT 0,   -- Token 分类统计：
   output_tokens INTEGER NOT NULL DEFAULT 0,  --   输入/输出/
   cache_tokens INTEGER NOT NULL DEFAULT 0,   --   缓存命中
+  reasoning_tokens INTEGER NOT NULL DEFAULT 0, --   推理/思考（含在输出内，单独对账用）
   cost REAL NOT NULL DEFAULT 0,      -- 按价格表计算的成本
   total_latency_ms INTEGER,          -- 总延迟
   ttft_ms INTEGER,                   -- 首 Token 延迟（仅流式）
@@ -82,6 +83,7 @@ class UsageRecord:
     input_tokens: int = 0
     output_tokens: int = 0
     cache_tokens: int = 0
+    reasoning_tokens: int = 0
     cost: float = 0.0
     total_latency_ms: int | None = None
     ttft_ms: int | None = None
@@ -115,6 +117,15 @@ class UsageLedger:
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.executescript(_SCHEMA)
+        # 旧库平滑迁移：reasoning_tokens 是后加的列。SQLite 的 ADD COLUMN
+        # 没有 IF NOT EXISTS 语法，用 table_info 探测已有列再决定是否补齐，
+        # 让老数据库文件无需重建即可继续写入完整 Token 分类。
+        cursor = await self._db.execute("PRAGMA table_info(usage_records)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "reasoning_tokens" not in columns:
+            await self._db.execute(
+                "ALTER TABLE usage_records ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0"
+            )
         await self._db.commit()
 
     async def close(self) -> None:
@@ -139,6 +150,22 @@ class UsageLedger:
         cursor = await self._db.execute(
             "SELECT * FROM usage_records ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
         )
+        return await self._rows(cursor)
+
+    async def by_request(self, request_id: str) -> list[dict[str, Any]]:
+        """按网关请求 ID 精确查询（响应头 X-Request-Id 原样回查）。
+
+        调用方对账失败调用（限流 429、上游失败等）的主入口：
+        无论请求在生命周期的哪一步终局，凭同一个 request_id 必能查到记录。
+        """
+        assert self._db is not None, "ledger not connected"
+        cursor = await self._db.execute(
+            "SELECT * FROM usage_records WHERE request_id = ? ORDER BY id DESC", (request_id,)
+        )
+        return await self._rows(cursor)
+
+    @staticmethod
+    async def _rows(cursor: aiosqlite.Cursor) -> list[dict[str, Any]]:
         rows = await cursor.fetchall()
         result = [dict(row) for row in rows]
         for row in result:

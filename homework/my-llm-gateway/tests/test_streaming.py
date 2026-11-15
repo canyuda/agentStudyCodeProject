@@ -123,6 +123,34 @@ def test_stream_usage_omitted_when_include_usage_false(ctx):
     assert ctx.latest_usage()["output_tokens"] == 2
 
 
+def test_anthropic_stream_usage_merged_from_start_and_delta_events(ctx):
+    """Standard Anthropic streams carry input/cache ONLY in message_start and
+    cumulative output ONLY in message_delta: the gateway must merge both events,
+    otherwise input/cache silently read as zero (17 in / 3 cached / 5 out)."""
+    ctx.anth.enqueue({"type": "stream", "deltas": ["a", "b"],
+                      "usage": {"input_tokens": 17, "output_tokens": 5}, "cache_tokens": 3})
+    with ctx.chat({"model": "flash", "stream": True}) as r:
+        assert r.status_code == 200
+        text = r.read().decode()
+    finals = [e for e in parse_sse(text) if e.get("choices") and e["choices"][0].get("finish_reason")]
+    assert finals[0]["usage"]["prompt_tokens"] == 17  # north final chunk carries the merged usage too
+    row = ctx.latest_usage()
+    assert (row["input_tokens"], row["cache_tokens"], row["output_tokens"]) == (17, 3, 5)
+
+
+def test_responses_stream_completed_reasoning_classification_kept(ctx):
+    """response.completed usage nests reasoning tokens in output_tokens_details:
+    the classification must survive into the ledger, not be dropped."""
+    ctx.resp.enqueue({"type": "stream", "deltas": ["x"], "reasoning_tokens": 2,
+                      "usage": {"input_tokens": 8, "output_tokens": 3}})
+    with ctx.chat({"stream": True}) as r:
+        assert r.status_code == 200
+        r.read()
+    row = ctx.latest_usage()
+    assert (row["input_tokens"], row["output_tokens"]) == (8, 3)
+    assert row["reasoning_tokens"] == 2
+
+
 def test_request_parsing_extracts_content_parts():
     payload = ChatCompletionRequest.model_validate(
         {"model": "m", "messages": [

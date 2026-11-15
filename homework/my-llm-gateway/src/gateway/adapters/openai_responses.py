@@ -112,25 +112,33 @@ class OpenAIResponsesAdapter(UpstreamAdapter):
 
     @staticmethod
     def _usage(data: dict[str, Any] | None) -> Usage:
-        """用量映射：input_tokens/output_tokens 平铺，缓存命中数嵌套在
-        input_tokens_details.cached_tokens 里——两层结构都要处理。
+        """用量映射：input_tokens/output_tokens 平铺；缓存命中数嵌套在
+        input_tokens_details.cached_tokens，推理 Token 嵌套在
+        output_tokens_details.reasoning_tokens——三层结构都要处理，
+        推理分类丢失会让用量对账无法区分正文输出与不可见推理。
         `or 0` 防御 None/缺字段。"""
         data = data or {}
         usage = Usage(
             input_tokens=int(data.get("input_tokens", 0) or 0),
             output_tokens=int(data.get("output_tokens", 0) or 0),
         )
-        details = data.get("input_tokens_details") or {}
-        usage.cache_tokens = int(details.get("cached_tokens", 0) or 0)
+        usage.cache_tokens = int((data.get("input_tokens_details") or {}).get("cached_tokens", 0) or 0)
+        usage.reasoning_tokens = int((data.get("output_tokens_details") or {}).get("reasoning_tokens", 0) or 0)
         return usage
 
-    def parse_stream_event(self, event: str | None, data: dict[str, Any]) -> StreamEvent | None:
+    def parse_stream_event(
+        self, event: str | None, data: dict[str, Any], acc: dict[str, Any] | None = None
+    ) -> StreamEvent | None:
         """Responses 流式事件 -> 统一 Delta/Done 事件（场景 18 的核心）。
+
+        acc 签名与基类对齐但本协议用不上：Responses 的用量完整挂在
+        response.completed 一个事件里，不存在跨事件拆分。
+        （Anthropic 侧的跨事件合并见其适配器。）
 
         事件序列（简化）：
             response.created               流开始（本网关不转发）
             response.output_text.delta     文本增量（多条）
-            response.completed             收尾：状态 + 用量
+            response.completed             收尾：状态 + 用量（含推理分类）
             response.failed / error        失败
         """
         if event == "response.output_text.delta":

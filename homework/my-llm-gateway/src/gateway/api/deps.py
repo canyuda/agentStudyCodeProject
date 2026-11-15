@@ -13,15 +13,17 @@ require_auth 是"横切关注点做成依赖"的示范：任何端点声明
 from __future__ import annotations
 
 import hmac
+import time
 from dataclasses import dataclass
 
 from fastapi import Request
 
 from gateway.checkpoint.store import CheckpointStore
 from gateway.config import GatewayConfig
-from gateway.errors import invalid_api_key
-from gateway.ledger.store import UsageLedger
-from gateway.pipeline import Pipeline
+from gateway.errors import GatewayError, invalid_api_key
+from gateway.ir import ChatIR
+from gateway.ledger.store import UsageLedger, fingerprint
+from gateway.pipeline import CallState, Pipeline
 from gateway.prompts.store import PromptStore
 from gateway.resilience.breaker import CircuitBreakerRegistry
 from gateway.resilience.ratelimit import TokenBucketRateLimiter
@@ -62,3 +64,26 @@ def require_auth(request: Request) -> str:
     if not any(hmac.compare_digest(key, candidate) for candidate in state.config.auth.gateway_keys):
         raise invalid_api_key()  # 与密钥表中任何一把都不匹配
     return key
+
+
+async def begin_call(request: Request, state: AppState, key: str, ir: ChatIR) -> CallState:
+    """两个北向入口共用的"管道前"步骤：初始化请求生命周期状态 + 本地限流。
+
+    限流拒绝也 MUST 落账（请求生命周期的第一笔记录）：先建 CallState 再做
+    限流检查，令牌不足时经 pipeline.record_rejection 写入账本后照常抛 429
+    ——调用方拿响应头的 X-Request-Id 就能在 /admin/usage?request_id= 查到
+    这条失败记录，本地限流因此不会产生"账本外的隐身调用"。
+    """
+    call_state = CallState(
+        request_id=request.state.request_id,
+        entrypoint=request.url.path,
+        key_fingerprint=fingerprint(key),
+        alias=ir.model,
+        start_time=time.monotonic(),
+    )
+    try:
+        state.rate_limiter.check(call_state.key_fingerprint, ir.model)
+    except GatewayError as exc:
+        await state.pipeline.record_rejection(call_state, exc)
+        raise
+    return call_state

@@ -9,7 +9,8 @@
 4. 最大输出：max_tokens 是【必填】字段——调用方没传时必须注入安全默认值
 5. 结构化输出：无原生 JSON Schema 约束能力
    -> 把 Schema 转译为"格式指令"注入系统提示，靠网关本地校验+修复闭环兜底
-6. 流式事件：content_block_delta 文本增量 + message_delta 收尾（带停止原因与用量）
+6. 流式事件：content_block_delta 文本增量 + message_delta 收尾（停止原因与输出用量）；
+   输入/缓存用量只在 message_start 出现，须与收尾事件合并才是完整用量
 7. 停止原因：stop_reason 枚举（end_turn/max_tokens/stop_sequence）需映射回北向语义
 """
 
@@ -29,7 +30,7 @@ from gateway.ir import (
     non_system_messages,
 )
 
-from .base import UpstreamAdapter, UpstreamError
+from .base import UpstreamAdapter, UpstreamError, merge_usage
 
 # max_tokens 在 Anthropic 协议中是必填项：调用方未传时注入的安全默认值。
 # 取 4096 是"够用且不昂贵"的折中——教学项目里也方便改成配置。
@@ -123,33 +124,58 @@ class AnthropicMessagesAdapter(UpstreamAdapter):
             cache_tokens=int(data.get("cache_read_input_tokens", 0) or 0),
         )
 
-    def parse_stream_event(self, event: str | None, data: dict[str, Any]) -> StreamEvent | None:
+    def parse_stream_event(
+        self, event: str | None, data: dict[str, Any], acc: dict[str, Any] | None = None
+    ) -> StreamEvent | None:
         """Anthropic 流式事件 -> 统一 Delta/Done 事件。
 
         事件序列（简化）：
-            message_start          消息元信息（本网关不转发）
+            message_start          消息元信息 + 【输入/缓存用量基线】（暂存进 acc）
             content_block_start    内容块开始
             content_block_delta    文本增量（delta.type == "text_delta"）
             content_block_stop     内容块结束
-            message_delta          收尾：stop_reason + 用量
+            message_delta          收尾：stop_reason + 输出用量（与 acc 基线合并）
             message_stop           消息结束
             ping                   保活心跳（直接忽略）
+
+        【用量拆在两个事件里】标准 Anthropic 流的 input_tokens 与
+        cache_read_input_tokens 只在 message_start 出现，message_delta 通常
+        只带累计 output_tokens——只取收尾事件会把输入/缓存记成 0。
+        两段用量经 acc（每流独立的跨事件累计器）用 merge_usage 汇合：
+        后到的字段覆盖先到值，先到而收尾缺失的字段保留（绝不因缺字段清零）。
         """
+        acc = acc if acc is not None else {}  # 脱离基类 stream_events 直接调用时也能工作
+        if event == "message_start":
+            # 用量基线：输入与缓存在此先到（此时输出尚未产生），暂存待收尾合并
+            message = data.get("message") or {}
+            acc["usage"] = merge_usage(
+                acc.get("usage"),
+                message.get("usage") or {},
+                ("input_tokens", "input_tokens"),
+                ("output_tokens", "output_tokens"),
+                ("cache_read_input_tokens", "cache_tokens"),
+            )
+            return None  # 起始事件不产生北向内容
         if event == "content_block_delta":
             delta = data.get("delta") or {}
             if delta.get("type") == "text_delta":
                 return DeltaEvent(content=delta.get("text", "") or "")
             return None  # 其他类型的块增量（如工具调用）本网关不处理
         if event == "message_delta":
-            # 收尾事件同时携带停止原因与用量——两个都从这里取
+            # 收尾事件携带停止原因与输出用量；输入/缓存从 acc 基线汇合进来
             stop = (data.get("delta") or {}).get("stop_reason")
-            return DoneEvent(
-                finish_reason=_STOP_REASON_MAP.get(stop, "stop"), usage=self._usage(data.get("usage"))
+            usage = merge_usage(
+                acc.get("usage"),
+                data.get("usage") or {},
+                ("input_tokens", "input_tokens"),
+                ("output_tokens", "output_tokens"),
+                ("cache_read_input_tokens", "cache_tokens"),
             )
+            return DoneEvent(finish_reason=_STOP_REASON_MAP.get(stop, "stop"), usage=usage)
         if event == "error":
             err = data.get("error") or {}
             raise UpstreamError(500, err.get("message") or json.dumps(data)[:300], "upstream_stream_error")
-        return None  # message_start / content_block_start / ping / message_stop 与北向文本无关
+        return None  # content_block_start / ping / message_stop 与北向文本无关
 
     def parse_error_body(self, status: int, body: dict[str, Any]) -> UpstreamError:
         """Anthropic 错误体：{"type":"error","error":{type,message}}（外层多包了一层

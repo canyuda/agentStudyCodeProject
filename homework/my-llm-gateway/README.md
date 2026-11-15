@@ -107,8 +107,11 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 ### 5) 用量查询与管理
 
 ```bash
-# 分页查询最近用量（含 Token 分类、成本、延迟、TTFT、重试/切换计数、模板版本）
+# 分页查询最近用量（含 Token 分类：输入/输出/缓存/推理，及成本、延迟、TTFT、重试/切换计数、模板版本）
 curl -s "http://127.0.0.1:8000/admin/usage?limit=5" -H "Authorization: Bearer $KEY"
+
+# 按请求 ID 精确对账：凭响应头 X-Request-Id 回查该次调用（含本地限流 429 等失败调用）
+curl -s "http://127.0.0.1:8000/admin/usage?request_id=<X-Request-Id>" -H "Authorization: Bearer $KEY"
 
 # 路由表 + 各供应商熔断状态
 curl -s http://127.0.0.1:8000/admin/routes -H "Authorization: Bearer $KEY"
@@ -125,7 +128,7 @@ curl -s http://127.0.0.1:8000/v1/models -H "Authorization: Bearer $KEY"
 | `/v1/responses` | POST | Responses 协议第二入口（共用同一管道） |
 | `/v1/models` | GET | 公开别名列表 |
 | `/v1/prompts`、`/v1/prompts/{id}`(/activate /render) | POST/GET | 提示词创建/列表/查询/激活/渲染预览 |
-| `/admin/usage` | GET | 分页查询用量记录 |
+| `/admin/usage` | GET | 分页查询用量记录；`?request_id=` 按请求 ID 精确对账（含 429 失败调用） |
 | `/admin/routes` | GET | 路由表与熔断状态 |
 | `/v1/streams/{request_id}/checkpoint` | GET | 流检查点（默认关闭） |
 | `/healthz`、`/readyz` | GET | 无鉴权探活 |
@@ -135,7 +138,7 @@ curl -s http://127.0.0.1:8000/v1/models -H "Authorization: Bearer $KEY"
 ## 能力边界声明（重要）
 
 - **流式不做结构化修复**：已下发的内容无法撤回，流式请求的 Schema 只透传、不本地纠错；严格业务协议请使用非流式接口。
-- **include_usage 提示**：流式调用只有在上游返回 usage 事件时才能精确记账（Chat 入口默认在末块带用量）；若上游未返回，Token 记为 0。
+- **include_usage 提示**：流式调用只有在上游返回 usage 事件时才能精确记账。协议差异已消化：Anthropic 流的输入/缓存挂在 `message_start`、输出挂在 `message_delta`，网关合并两段为完整用量；Responses 的推理 Token 分类（`output_tokens_details.reasoning_tokens`）单独入账。若上游始终未返回用量，Token 记为 0。
 - **模板不能消除提示词注入**：模板降低重复与配置漂移，生产仍需隔离不可信输入、限制工具权限、把模型输出当不可信数据。
 - **脱敏的同形限制**：用户有意发送的同形字符串（测试样例、代码片段）也会被替换，属可接受行为；模型改写/丢失占位符时该占位符原样保留，**绝不**把原值重新发给模型修补。脱敏映射表仅存在于请求内存作用域，不写日志/账本/任何持久化存储。
 - **流检查点会持久化模型正文**：开启前必须先确定加密、权限与数据保留策略；它解决断线找回，**不突破模型上下文窗口限制**——超长任务仍应由上层 Agent 分段、摘要或检索式续写。

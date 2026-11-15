@@ -26,7 +26,10 @@
 
 3.【账本兜底】
    无论成功/失败/取消，每次调用必落一条用量记录（try/except/finally
-   全覆盖），这是可观测性需求的根基。注意隐私红线：账本永不落消息正文。
+   全覆盖），这是可观测性需求的根基。用量口径：结构化修复的多轮上游
+   调用按"已知消耗合计"入账（成功与 422 终局都不丢轮次）；网关本地
+   拒绝（限流 429）经 record_rejection 落账。注意隐私红线：账本永不落
+   消息正文。
 
 依赖注入说明：Pipeline 不自己创建任何资源（HTTP 客户端、数据库连接都由
 main.py 装配后传入），这让测试可以注入 MockTransport 假上游。
@@ -37,7 +40,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -93,6 +96,7 @@ class CallState:
     provider: str | None = None  # 实际命中的供应商
     upstream_model: str | None = None  # 真实上游模型 ID（只进账本，绝不北向）
     usage: Usage | None = None  # Token 用量（流式在收尾事件到达后填充）
+    usage_attempts: list[Usage] = field(default_factory=list)  # 每次成功上游调用的已知用量（含修复轮次）
     mask_session: MaskSession | None = None  # 脱敏会话（请求内存作用域，结束即弃）
     mask_hits: dict[str, int] | None = None  # 按类型计数的脱敏命中数（不含内容）
     cancelled: bool = False  # 客户端是否中途断开
@@ -101,6 +105,27 @@ class CallState:
     def elapsed_ms(self) -> int:
         """距请求开始的毫秒数（打点用）。"""
         return int((time.monotonic() - self.start_time) * 1000)
+
+    def add_usage(self, usage: Usage) -> None:
+        """累计一次上游调用的已知用量。
+
+        结构化修复会对同一请求多次调用上游，每轮都是真实消耗：逐次记录，
+        成功与失败终态才能都按"已知消耗合计"对账，而不是只记最后一轮。
+        """
+        self.usage_attempts.append(usage)
+
+    @property
+    def total_usage(self) -> Usage | None:
+        """各次已知用量的合计；一次成功调用都没有时为 None（账本记 0）。"""
+        if not self.usage_attempts:
+            return None
+        total = Usage()
+        for attempt in self.usage_attempts:
+            total.input_tokens += attempt.input_tokens
+            total.output_tokens += attempt.output_tokens
+            total.cache_tokens += attempt.cache_tokens
+            total.reasoning_tokens += attempt.reasoning_tokens
+        return total
 
 
 @dataclass
@@ -190,11 +215,17 @@ class Pipeline:
         try:
             ir = await self._prepare(ir, state)
             result = await self._call_upstream(ir, state)
+            state.add_usage(result.usage)
             if ir.constraint is not None:
                 result = await self._structured_repair(ir, state, result)
             if state.mask_session is not None:
                 result.text = state.mask_session.restore_text(result.text)  # 最终还原
-            state.usage = result.usage
+            # 已知消耗合计（含修复轮次）：北向响应与账本共用同一口径，
+            # 调用方拿响应里的 usage 就能与账本记录逐 Token 对上
+            total = state.total_usage
+            if total is not None:
+                result.usage = total
+                state.usage = total
             await self._record(state, "success", http_status=200)
             return result
         except GatewayError as exc:
@@ -274,6 +305,7 @@ class Pipeline:
                 IRMessage(role="user", content=repair_instruction(verdict.error or "", ir.constraint.schema)),
             ]
             result = await self._call_upstream(ir.model_copy(update={"messages": repair_messages}), state)
+            state.add_usage(result.usage)  # 修复轮次的已知消耗同样累计（422 终局也不丢）
 
     # ------------------------------------------------------------------
     # 流式路径（本模块最精妙的部分，配合 tests/test_streaming.py 阅读）
@@ -422,6 +454,15 @@ class Pipeline:
         state.provider = candidate.provider_name
         state.upstream_model = candidate.model_id
 
+    async def record_rejection(self, state: CallState, error: GatewayError) -> None:
+        """网关本地拒绝（限流 429 等）的生命周期记账。
+
+        请求还没进管道就已终局，仍 MUST 落一条失败记录——否则调用方拿
+        X-Request-Id 对账时会发现"这次调用凭空消失"。此时协议/供应商/
+        用量均为空（请求从未触达上游）。
+        """
+        await self._record(state, "failed", http_status=error.status_code, error=error)
+
     async def _record(
         self,
         state: CallState,
@@ -432,10 +473,13 @@ class Pipeline:
     ) -> None:
         """把 CallState 组装成一条完整用量记录写入账本（字段全集见需求 6.1）。
 
+        用量取值优先级：显式传入 > state.usage（成功收尾时已设为合计） >
+        各次已知调用合计（修复中途失败等还没来得及设 state.usage 的路径） >
+        全 0（从未成功调用过上游，如限流拒绝）。
         成本按价格表实时计算；未配置价格的别名记 0。
         注意：这里没有任何消息正文——隐私红线在数据结构层面保证。
         """
-        usage = usage or state.usage or Usage()
+        usage = usage or state.usage or state.total_usage or Usage()
         record = UsageRecord(
             request_id=state.request_id,
             entrypoint=state.entrypoint,
@@ -448,6 +492,7 @@ class Pipeline:
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             cache_tokens=usage.cache_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
             cost=compute_cost(self.config.pricing.get(state.alias), usage),
             total_latency_ms=state.elapsed_ms,
             ttft_ms=state.ttft_ms,

@@ -25,11 +25,10 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from gateway.api.deps import AppState, get_state, require_auth
+from gateway.api.deps import AppState, begin_call, get_state, require_auth
 from gateway.api.schemas import ChatCompletionRequest, parse_chat_request
 from gateway.ir import CompletionResult, DeltaEvent, DoneEvent
-from gateway.ledger.store import fingerprint
-from gateway.pipeline import CallState, NorthStreamEvent, StreamErrorEvent
+from gateway.pipeline import NorthStreamEvent, StreamErrorEvent
 
 router = APIRouter()
 
@@ -69,15 +68,8 @@ async def chat_completions(
     key: str = Depends(require_auth),
 ):
     ir = parse_chat_request(payload)
-    # pipeline order: auth -> rate limit -> (render -> mask -> route happen inside pipeline)
-    state.rate_limiter.check(fingerprint(key), ir.model)
-    call_state = CallState(
-        request_id=request.state.request_id,
-        entrypoint="/v1/chat/completions",
-        key_fingerprint=fingerprint(key),
-        alias=ir.model,
-        start_time=time.monotonic(),
-    )
+    # pipeline order: auth -> rate limit (rejections also land in the ledger) -> render -> ...
+    call_state = await begin_call(request, state, key, ir)
     if not ir.stream:
         result: CompletionResult = await state.pipeline.complete(ir, call_state)
         return JSONResponse(

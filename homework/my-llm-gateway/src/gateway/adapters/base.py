@@ -82,9 +82,16 @@ class UpstreamAdapter(ABC):
     def parse_response(self, data: dict[str, Any]) -> CompletionResult: ...
 
     @abstractmethod
-    def parse_stream_event(self, event: str | None, data: dict[str, Any]) -> StreamEvent | None:
+    def parse_stream_event(
+        self, event: str | None, data: dict[str, Any], acc: dict[str, Any] | None = None
+    ) -> StreamEvent | None:
         """把一条上游 SSE 事件映射为 DeltaEvent/DoneEvent。
 
+        acc 是【本条流内部】的跨事件累计器（stream_events 每开一条流新建一个，
+        流与流之间互不共享，适配器实例因此保持无状态并发安全）：某些协议把
+        用量拆在多个事件里（如 Anthropic 的 message_start 先带输入/缓存、
+        message_delta 再带输出），适配器把先到的部分暂存进 acc，收尾事件里
+        用 merge_usage 合并成完整用量再放进 DoneEvent。
         返回 None 表示该事件对北向无意义（如 Anthropic 的 ping 事件）；
         遇到错误事件直接 raise UpstreamError。
         """
@@ -171,8 +178,9 @@ class UpstreamAdapter(ABC):
             body = await response.aread()
             raise self.parse_error_body(response.status_code, _safe_bytes(body))
         try:
+            acc: dict[str, Any] = {}  # per-stream accumulator: usage may arrive split across events
             async for event, data in _sse_lines(response):
-                mapped = self.parse_stream_event(event, data)
+                mapped = self.parse_stream_event(event, data, acc)
                 if mapped is not None:
                     yield mapped
         finally:

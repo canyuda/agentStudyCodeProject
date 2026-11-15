@@ -108,6 +108,36 @@ def test_anthropic_instruction_injection_and_repair_loop(tmp_path):
         assert "JSON Schema" in ctx.anth.requests[1]["body"]["system"]
 
 
+def test_repair_attempts_usage_accumulated_on_success(ctx):
+    """Two upstream calls with known usage 13/7 then 5/3: the success terminal state
+    must bill the SUM (18/10), not just the last round; north usage shares the same
+    figure so callers can reconcile against the ledger."""
+    ctx.resp.enqueue({"type": "text", "text": "not json at all",
+                      "usage": {"input_tokens": 13, "output_tokens": 7}})
+    ctx.resp.enqueue({"type": "text", "text": '{"team": "billing"}',
+                      "usage": {"input_tokens": 5, "output_tokens": 3}})
+    r = ctx.chat(_structured())
+    assert r.status_code == 200
+    assert r.json()["usage"] == {"prompt_tokens": 18, "completion_tokens": 10, "total_tokens": 28}
+    row = ctx.latest_usage()
+    assert (row["input_tokens"], row["output_tokens"]) == (18, 10)
+    assert row["retries"] == 1  # the repair round still shows up in the retry counter
+
+
+def test_repair_attempts_usage_accumulated_on_422(ctx):
+    """Repair exhausted -> 422: tokens already consumed by BOTH attempts (13/7 + 5/3)
+    must not be written off as zero just because the request ultimately failed."""
+    ctx.resp.enqueue({"type": "text", "text": "still not json",
+                      "usage": {"input_tokens": 13, "output_tokens": 7}})
+    ctx.resp.enqueue({"type": "text", "text": "still not json",
+                      "usage": {"input_tokens": 5, "output_tokens": 3}})
+    r = ctx.chat(_structured())
+    assert r.status_code == 422
+    row = ctx.latest_usage()
+    assert row["status"] == "failed" and row["http_status"] == 422
+    assert (row["input_tokens"], row["output_tokens"]) == (18, 10)
+
+
 def test_responses_protocol_native_schema_passthrough(ctx):
     """Responses upstream: json_schema passed through natively (text.format)."""
     ctx.resp.default_text(json.dumps({"team": "support"}))

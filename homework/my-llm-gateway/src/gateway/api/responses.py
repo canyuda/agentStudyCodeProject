@@ -23,11 +23,10 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from gateway.api.deps import AppState, get_state, require_auth
+from gateway.api.deps import AppState, begin_call, get_state, require_auth
 from gateway.api.schemas import ResponsesRequest, parse_responses_request
 from gateway.ir import CompletionResult, DeltaEvent, DoneEvent
-from gateway.ledger.store import fingerprint
-from gateway.pipeline import CallState, NorthStreamEvent, StreamErrorEvent
+from gateway.pipeline import NorthStreamEvent, StreamErrorEvent
 
 router = APIRouter()
 
@@ -62,6 +61,9 @@ def _response_object(request_id: str, alias: str, text: str | None, usage) -> di
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
             "total_tokens": usage.input_tokens + usage.output_tokens,
+            # protocol-native breakdown: reasoning tokens are part of output,
+            # surfaced separately so callers can reconcile visible vs invisible spend
+            "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens},
         }
     return obj
 
@@ -74,14 +76,7 @@ async def create_response(
     key: str = Depends(require_auth),
 ):
     ir = parse_responses_request(payload)
-    state.rate_limiter.check(fingerprint(key), ir.model)
-    call_state = CallState(
-        request_id=request.state.request_id,
-        entrypoint="/v1/responses",
-        key_fingerprint=fingerprint(key),
-        alias=ir.model,
-        start_time=time.monotonic(),
-    )
+    call_state = await begin_call(request, state, key, ir)
     if not ir.stream:
         result: CompletionResult = await state.pipeline.complete(ir, call_state)
         return JSONResponse(

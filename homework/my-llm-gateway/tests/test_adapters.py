@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import build_ctx
+from tests.conftest import AUTH, build_ctx
 
 
 def test_responses_adapter_request_rewrite(ctx):
@@ -120,3 +120,40 @@ def test_both_protocols_basic_nonstream(tmp_path, protocol_alias, upstream):
         assert r.status_code == 200
         assert r.json()["choices"][0]["message"]["content"] == f"answer-{upstream}"
         assert r.json()["model"] == protocol_alias  # alias echoed, not real model id
+
+
+def test_responses_usage_token_classifications_preserved(ctx):
+    """Responses usage nests cache/reasoning breakdowns in *_details objects:
+    all classifications must reach the ledger, none read back as zero."""
+    ctx.resp.enqueue({"type": "text", "text": "done", "cached_tokens": 4, "reasoning_tokens": 6,
+                      "usage": {"input_tokens": 12, "output_tokens": 9}})
+    r = ctx.chat({})
+    assert r.status_code == 200
+    row = ctx.latest_usage()
+    assert (row["input_tokens"], row["output_tokens"]) == (12, 9)
+    assert row["cache_tokens"] == 4 and row["reasoning_tokens"] == 6
+
+
+def test_responses_entry_north_usage_echoes_reasoning(ctx):
+    """/v1/responses north usage carries the protocol-native output_tokens_details,
+    and the ledger row for the same X-Request-Id reconciles token by token."""
+    ctx.resp.enqueue({"type": "text", "text": "done", "reasoning_tokens": 1,
+                      "usage": {"input_tokens": 2, "output_tokens": 1}})
+    r = ctx.client.post("/v1/responses", json={"model": "pro", "input": "again"}, headers=AUTH)
+    assert r.status_code == 200
+    usage = r.json()["usage"]
+    assert usage["output_tokens_details"] == {"reasoning_tokens": 1}
+    rid = r.headers["x-request-id"]
+    ledger_row = ctx.client.get(f"/admin/usage?request_id={rid}", headers=AUTH).json()["records"][0]
+    assert ledger_row["reasoning_tokens"] == 1  # north usage and ledger share one measurement
+
+
+def test_anthropic_nonstream_cache_classification_unaffected(ctx):
+    """Non-stream Anthropic usage keeps working: cache_read maps to cache_tokens."""
+    ctx.anth.enqueue({"type": "text", "text": "ok", "usage": {"input_tokens": 14, "output_tokens": 2},
+                      "cache_tokens": 5})
+    r = ctx.chat({"model": "flash"})
+    assert r.status_code == 200
+    row = ctx.latest_usage()
+    assert (row["input_tokens"], row["cache_tokens"], row["output_tokens"]) == (14, 5, 2)
+    assert row["reasoning_tokens"] == 0  # protocol has no reasoning classification
