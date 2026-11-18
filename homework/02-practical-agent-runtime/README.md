@@ -25,7 +25,7 @@ python3 -m venv .venv
 | 2 | `TransferArgs` | 账号正则 `^ACC-[A-Z]-[0-9]{6}$`，金额 `(0, 100000]`，继承 `extra="forbid"` |
 | 3 | `transfer_precheck` | 教学限额区间 `(50000, 80000]` → `EXCEED_LIMIT`；余额不足 → `INSUFFICIENT_BALANCE` |
 | 4 | `transfer_handler` | `> 80000` 先 `sleep(3.0)`；转入账户不存在 → `ACCOUNT_NOT_FOUND`；双向改余额；返回 `txn_id` |
-| 5 | `build_governance` | 注册 `transfer`：`WRITE` + `HIGH` + `requires_approval` + `timeout_seconds=3.0` |
+| 5 | `build_governance` | 注册 `transfer`：`WRITE` + `HIGH` + `requires_approval` + `timeout_seconds=2.0` |
 | 6 | `redact` | 邮箱脱敏后追加账号脱敏，`ACC-A-123456` → `ACC-A-****3456` |
 | 验证 | `run_transfer_scenarios` / `tests/test_tool_governance.py` | 下列 5 个测试项 |
 
@@ -35,7 +35,7 @@ python3 -m venv .venv
 
 命令：`python -m pytest tests/test_tool_governance.py -v -k "transfer"`
 
-**结果：5 passed in 3.22s**
+**结果：5 passed in 2.07s**
 
 | 测试项 | 覆盖点 | 实测 |
 | --- | --- | --- |
@@ -48,13 +48,13 @@ python3 -m venv .venv
 关键输出（测试项 4，`-s` 可见）：
 
 ```json
-{"redacted_content": {"txn_id": "t4_3", "from": "ACC-A-****3456", "to": "ACC-A-****4321", "amount": 1000.0, "status": "succeeded"}}
+{"redacted_content": {"txn_id": "ansfer", "from": "ACC-A-****3456", "to": "ACC-A-****4321", "amount": 1000.0, "status": "accepted"}}
 {"audit_tail": {"tool_call_id": "t4_4", "tool_name": "transfer", "decision": "deny", "ok": false, "error_code": "APPROVAL_REQUIRED", ...}}
 ```
 
 ## 已知注意事项
 
-- 测试项 5 的 `sleep(3.0)` 与 `timeout_seconds=3.0` 截止点相同；当前实测稳定触发超时，若机器调度抖动可改为 `sleep(3.2)`。
-- `transfer_precheck` 只保留两个错误码；转出账户不存在时抛 `KeyError`（演示数据不含该情况）。
+- 超时策略 `timeout_seconds=2.0` 与处理器的 `sleep(3.0)` 明确分离，实测耗时约 2001ms，稳定触发超时。
+- `transfer_precheck` 对缺失或其他租户的转出账户返回受控 `ACCOUNT_NOT_FOUND`，不再抛 `KeyError`。
 - 金额以 `float` 入参，内部统一用 `Decimal(str(...))` 比较与计算。
-- 未改动 `PermissionEngine.decide`；所有验证调用均经 `ToolRuntime.invoke`；`StrictArgs` 的 `extra="forbid"` 保留。
+- 未改动 `PermissionEngine.decide`；`Handler` 保持两参契约；审批请求在审计中记为 `confirm`（三态保留），并带 `stage` 字段；`TransferArgs` 启用 `strict=True`，数值字符串在参数校验阶段即被拒绝。

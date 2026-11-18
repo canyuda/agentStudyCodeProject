@@ -44,6 +44,9 @@ class RunShellArgs(StrictArgs):
 # ===== 任务 2：定义转账参数模型（Pydantic） =====
 class TransferArgs(StrictArgs):
     # 转账工具的参数契约：约束收付款账户格式与转账金额边界。
+    # strict=True：数值字符串等隐式转换一律拒绝，不得绕过校验进入审批。
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
+
     from_account: str = Field(pattern=r"^ACC-[A-Z]-[0-9]{6}$")
     to_account: str = Field(pattern=r"^ACC-[A-Z]-[0-9]{6}$")
     amount: float = Field(gt=0, le=100000)
@@ -113,7 +116,7 @@ class ToolPolicy:
     enabled: bool = True
 
 
-Handler = Callable[[str, StrictArgs, ExecutionContext], Awaitable[dict[str, Any]]]
+Handler = Callable[[StrictArgs, ExecutionContext], Awaitable[dict[str, Any]]]
 Precheck = Callable[[StrictArgs, ExecutionContext], Awaitable[None]]
 CanonicalTarget = Callable[[StrictArgs, ExecutionContext], str]
 
@@ -424,7 +427,7 @@ class ToolRuntime:
     async def _execute_once(self, prepared: PreparedCall, ctx: ExecutionContext) -> dict[str, Any]:
         # 在工具策略规定的时限内执行一次实际处理器调用。
         async with asyncio.timeout(prepared.tool.policy.timeout_seconds):
-            return await prepared.tool.handler(prepared.call.id, prepared.args, ctx)
+            return await prepared.tool.handler(prepared.args, ctx)
 
     async def _execute_with_recovery(self, prepared: PreparedCall, ctx: ExecutionContext) -> dict[str, Any]:
         # 只重试读操作或显式幂等的写操作，避免重复产生不可逆副作用。
@@ -473,6 +476,7 @@ class ToolRuntime:
                 "decision": prepared.decision,
                 "effect": prepared.tool.policy.effect,
                 "risk": prepared.tool.policy.risk,
+                "stage": "executed",
                 "ok": ok,
                 "error_code": error_code,
                 "duration_ms": round((time.monotonic() - started_at) * 1000, 2),
@@ -493,6 +497,12 @@ class ToolRuntime:
         try:
             prepared = await self.before_tool_call(call, ctx)
         except PolicyDenied as exc:
+            # 审批待确认属于三态中的 CONFIRM，而不是 DENY；审计必须保留该区分。
+            decision = (
+                PermissionDecision.CONFIRM
+                if exc.code == "APPROVAL_REQUIRED"
+                else PermissionDecision.DENY
+            )
             await self.audit.write(
                 {
                     "trace_id": ctx.trace_id,
@@ -500,7 +510,8 @@ class ToolRuntime:
                     "tool_name": call.name,
                     "user_id": ctx.user_id,
                     "tenant_id": ctx.tenant_id,
-                    "decision": PermissionDecision.DENY,
+                    "decision": decision,
+                    "stage": "before_tool_call",
                     "ok": False,
                     "error_code": exc.code,
                     "duration_ms": round((time.monotonic() - started_at) * 1000, 2),
@@ -583,7 +594,7 @@ ACCOUNTS: dict[tuple[str, str], float] = {
 REFUNDS: dict[tuple[str, str], dict[str, Any]] = {}
 
 
-async def get_order(_tool_call_id: str, args: StrictArgs, ctx: ExecutionContext) -> dict[str, Any]:
+async def get_order(args: StrictArgs, ctx: ExecutionContext) -> dict[str, Any]:
     # 查询处理器：在租户隔离范围内读取订单，返回内容由运行时统一脱敏。
     assert isinstance(args, GetOrderArgs)
     order = ORDERS.get((ctx.tenant_id, args.order_id))
@@ -609,16 +620,18 @@ async def transfer_precheck(args: StrictArgs, context: ExecutionContext) -> None
     amount = Decimal(str(args.amount))
     if Decimal("50000") < amount <= Decimal("80000"):
         raise PolicyDenied("EXCEED_LIMIT", "单笔转账金额命中教学限额区间（50000, 80000]")
-    balance = ACCOUNTS[(context.tenant_id, args.from_account)]
+    # 缺失或其他租户的账户按受控业务拒绝处理，不允许 KeyError 击穿运行时。
+    balance = ACCOUNTS.get((context.tenant_id, args.from_account))
+    if balance is None:
+        raise PolicyDenied("ACCOUNT_NOT_FOUND", "转出账户不存在或不属于当前租户")
     if Decimal(str(balance)) < amount:
         raise PolicyDenied("INSUFFICIENT_BALANCE", "转出账户余额不足")
 
 
 # ===== 任务 4：实现转账处理函数 =====
-async def transfer_handler(
-    tool_call_id: str, args: StrictArgs, context: ExecutionContext
-) -> dict[str, Any]:
+async def transfer_handler(args: StrictArgs, context: ExecutionContext) -> dict[str, Any]:
     # 转账处理器：先模拟超时，再完成双向余额变更，返回可审计的转账结果。
+    # 说明：Handler 契约为两参，txn_id 取 trace_id 后 6 位标识本次调用。
     assert isinstance(args, TransferArgs)
     amount = Decimal(str(args.amount))
     if amount > Decimal("80000"):
@@ -630,15 +643,15 @@ async def transfer_handler(
     ACCOUNTS[from_key] = float(Decimal(str(ACCOUNTS[from_key])) - amount)
     ACCOUNTS[to_key] = float(Decimal(str(ACCOUNTS[to_key])) + amount)
     return {
-        "txn_id": tool_call_id[-6:],
+        "txn_id": context.trace_id[-6:],
         "from": args.from_account,
         "to": args.to_account,
         "amount": float(amount),
-        "status": "succeeded",
+        "status": "accepted",
     }
 
 
-async def create_refund(_tool_call_id: str, args: StrictArgs, ctx: ExecutionContext) -> dict[str, Any]:
+async def create_refund(args: StrictArgs, ctx: ExecutionContext) -> dict[str, Any]:
     # 退款写入处理器：按租户订单维度幂等创建并返回退款受理结果。
     assert isinstance(args, CreateRefundArgs)
     key = (ctx.tenant_id, args.order_id)
@@ -656,7 +669,7 @@ async def create_refund(_tool_call_id: str, args: StrictArgs, ctx: ExecutionCont
     return result
 
 
-async def run_shell(_tool_call_id: str, args: StrictArgs, _ctx: ExecutionContext) -> dict[str, Any]:
+async def run_shell(args: StrictArgs, _ctx: ExecutionContext) -> dict[str, Any]:
     assert isinstance(args, RunShellArgs)
     raise AssertionError("disabled shell tool must not execute")
 
@@ -719,15 +732,15 @@ def build_governance() -> tuple[ToolRuntime, ApprovalStore, AuditSink]:
             policy=ToolPolicy(
                 effect=Effect.WRITE,
                 risk=Risk.HIGH,
-                permission="transfer:create",
+                permission="transfer:execute",
                 requires_approval=True,
-                timeout_seconds=3.0,
+                timeout_seconds=2.0,
                 max_retries=0,
                 idempotent=False,
             ),
             handler=transfer_handler,
             precheck=transfer_precheck,
-            canonical_target=lambda args, ctx: f"{ctx.tenant_id}:{args.from_account}",
+            canonical_target=lambda args, ctx: f"{ctx.tenant_id}:{args.from_account}->{args.to_account}",
         ),
     ]
     return ToolRuntime(tools, PermissionEngine(), approvals, audit), approvals, audit
@@ -831,7 +844,7 @@ async def run_transfer_scenarios() -> None:
         trace_id="trace_transfer",
         user_id="u_200",
         tenant_id=tenant,
-        permissions=frozenset({"transfer:create"}),
+        permissions=frozenset({"transfer:execute"}),
         allowed_tools=frozenset({"transfer"}),
     )
 
@@ -839,11 +852,20 @@ async def run_transfer_scenarios() -> None:
         return {account: ACCOUNTS[(tenant, account)] for account in (payer, receiver, low)}
 
     def show(title: str, result: ToolResult) -> None:
+        # 显式打印三态动作：ALLOW 放行 / CONFIRM 待审批 / DENY 拒绝。
+        action = (
+            PermissionDecision.ALLOW
+            if result.ok
+            else PermissionDecision.CONFIRM
+            if result.error_code == "APPROVAL_REQUIRED"
+            else PermissionDecision.DENY
+        )
         print(
             json.dumps(
                 {
                     "case": title,
                     "tool_call_id": result.tool_call_id,
+                    "action": action,
                     "ok": result.ok,
                     "code": result.error_code or "OK",
                     "content": result.content,
@@ -866,6 +888,8 @@ async def run_transfer_scenarios() -> None:
         "账号格式非法": {"from_account": "ACC-A-12345", "to_account": receiver, "amount": 1000},
         "金额为 0": {"from_account": payer, "to_account": receiver, "amount": 0},
         "金额超过 10 万": {"from_account": payer, "to_account": receiver, "amount": 100001},
+        # strict=True 下数值字符串必须在参数校验阶段被拒，不能进入审批。
+        "金额为数值字符串": {"from_account": payer, "to_account": receiver, "amount": "1000"},
     }
     for index, (title, arguments) in enumerate(invalid_cases.items(), start=1):
         show(title, await runtime.invoke(ToolCall(f"t1_{index}", "transfer", arguments), base))
@@ -891,6 +915,17 @@ async def run_transfer_scenarios() -> None:
                 "t2_2",
                 "transfer",
                 {"from_account": low, "to_account": receiver, "amount": 30000},
+            ),
+            base,
+        ),
+    )
+    show(
+        "转出账户不属于当前租户",
+        await runtime.invoke(
+            ToolCall(
+                "t2_3",
+                "transfer",
+                {"from_account": "ACC-B-111111", "to_account": receiver, "amount": 1000},
             ),
             base,
         ),
